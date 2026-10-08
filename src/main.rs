@@ -22,7 +22,9 @@ fn main() {
     }
 
     mount::unshare_and_privatise_mounts();
+    // The fds must be read after unshare and privatise because otherwise they would be the fds of another mount namespace
     let config = config::parse_config(&PathBuf::from(&args[1])).expect("Failed to get config");
+
     mount::mount(config).expect("Failed to mount files");
 
     program::replace_with_program(

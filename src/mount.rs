@@ -1,4 +1,6 @@
-use std::os::fd::AsFd;
+use crate::config::MntOverride;
+// Needed for type annotations.
+use std::path::Path;
 
 #[derive(thiserror::Error, Debug)]
 pub enum OverlayError {
@@ -46,6 +48,7 @@ pub fn unshare_and_privatise_mounts() {
     use crate::utils::open_root;
     use rustix::thread::UnshareFlags;
     use rustix::thread::unshare_unsafe;
+    use std::os::fd::AsFd;
 
     unsafe { unshare_unsafe(UnshareFlags::NEWNS).expect("Could not unshare from mount namespace") }
 
@@ -63,41 +66,54 @@ pub fn unshare_and_privatise_mounts() {
     .expect("Failed to make / private");
 }
 
-pub fn mount(config: super::config::Input) -> Result<(), Error> {
+pub fn mount(config: Vec<MntOverride>) -> Result<(), Error> {
     // I never read a man page fully before this, I got to say that it is pretty usefull.
     // I hate to mix rustix and nix but I wrote a big deal with nix and why change what works...
-    // The new mount api was very fun to work with, Everyone definitely switch to it. 
+    // The new mount api was very fun to work with, Everyone definitely switch to it.
 
-    for file_override in &config.file_overrides {
-        set_file_bind_mount(file_override)?;
-        if cfg!(debug_assertions) {
-            println!(
-                "Bind mounted {} over {}",
-                file_override.source_path.display(),
-                file_override.target_path.display()
-            );
-        }
-    }
-
-    for dir_override in &config.dir_overrides {
-        if dir_override.overlayfs {
-            set_dir_overlayfs(dir_override)?;
-
-            if cfg!(debug_assertions) {
-                println!(
-                    "Set overlayfs {} over {}",
-                    dir_override.source_path.display(),
-                    dir_override.target_path.display()
-                );
+    for mnt_override in &config {
+        match mnt_override {
+            MntOverride::File(file_override) => {
+                set_bind_mount(
+                    &file_override.source,
+                    &file_override.target,
+                    &file_override.source_path,
+                    &file_override.target_path,
+                )?;
+                if cfg!(debug_assertions) {
+                    println!(
+                        "Bind mounted {} over {}",
+                        file_override.source_path.display(),
+                        file_override.target_path.display()
+                    );
+                }
             }
-        } else {
-            set_dir_bind_mount(dir_override)?;
-            if cfg!(debug_assertions) {
-                println!(
-                    "Bind mounted {} over {}",
-                    dir_override.source_path.display(),
-                    dir_override.target_path.display()
-                );
+            MntOverride::Dir(dir_override) => {
+                if dir_override.overlayfs {
+                    set_dir_overlayfs(dir_override)?;
+
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "Set overlayfs {} over {}",
+                            dir_override.source_path.display(),
+                            dir_override.target_path.display()
+                        );
+                    }
+                } else {
+                    set_bind_mount(
+                        &dir_override.source,
+                        &dir_override.target,
+                        &dir_override.source_path,
+                        &dir_override.target_path,
+                    )?;
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "Bind mounted {} over {}",
+                            dir_override.source_path.display(),
+                            dir_override.target_path.display()
+                        );
+                    }
+                }
             }
         }
     }
@@ -105,17 +121,24 @@ pub fn mount(config: super::config::Input) -> Result<(), Error> {
     Ok(())
 }
 
-fn set_file_bind_mount(file_override: &super::config::FileOverride) -> Result<(), Error> {
+/// Clone `source` into a detached mount, make it read-only, and move it onto `target`.
+fn set_bind_mount(
+    source: &impl std::os::fd::AsFd,
+    target: &impl std::os::fd::AsFd,
+    source_path: &Path,
+    target_path: &Path,
+) -> Result<(), Error> {
     use crate::mount_function::mount_setattr;
     use crate::mount_function::types::{AtFlags, MountAttr, MountAttrFlags, MountPropagationFlags};
     use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
+    use std::os::fd::AsFd;
 
     let detached_src_fd = open_tree(
-        &file_override.source,
+        source,
         "",
         OpenTreeFlags::AT_EMPTY_PATH | OpenTreeFlags::OPEN_TREE_CLONE,
     )
-    .map_err(|e| Error::OpenTree(file_override.source_path.clone(), e.into()))?;
+    .map_err(|e| Error::OpenTree(source_path.to_path_buf(), e.into()))?;
 
     mount_setattr(
         detached_src_fd.as_fd(),
@@ -123,69 +146,24 @@ fn set_file_bind_mount(file_override: &super::config::FileOverride) -> Result<()
         AtFlags::EMPTY_PATH,
         &MountAttr {
             attr_clr: MountAttrFlags::empty(),
-            attr_set: MountAttrFlags::MOUNT_ATTR_NOSYMFOLLOW
-                | MountAttrFlags::MOUNT_ATTR_RDONLY
-                | MountAttrFlags::MOUNT_ATTR_NOSUID,
+            attr_set: MountAttrFlags::MOUNT_ATTR_RDONLY,
             propagation: MountPropagationFlags::PRIVATE,
             userns_fd: None,
         },
     )
-    .map_err(|e| Error::SetAttr(file_override.source_path.clone(), e))?;
+    .map_err(|e| Error::SetAttr(source_path.to_path_buf(), e))?;
 
     move_mount(
         detached_src_fd,
         "",
-        &file_override.target,
+        target,
         "",
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
     )
     .map_err(|e| {
         Error::MoveMount(
-            file_override.source_path.clone(),
-            file_override.target_path.clone(),
-            e.into(),
-        )
-    })?;
-
-    Ok(())
-}
-
-fn set_dir_bind_mount(dir_override: &super::config::DirOverride) -> Result<(), Error> {
-    use crate::mount_function::mount_setattr;
-    use crate::mount_function::types::{AtFlags, MountAttr, MountAttrFlags, MountPropagationFlags};
-    use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
-
-    let detached_src_fd = open_tree(
-        &dir_override.source,
-        "",
-        OpenTreeFlags::AT_EMPTY_PATH | OpenTreeFlags::OPEN_TREE_CLONE,
-    )
-    .map_err(|e| Error::OpenTree(dir_override.source_path.clone(), e.into()))?;
-
-    mount_setattr(
-        detached_src_fd.as_fd(),
-        "",
-        AtFlags::EMPTY_PATH,
-        &MountAttr {
-            attr_clr: MountAttrFlags::empty(),
-            attr_set: MountAttrFlags::MOUNT_ATTR_RDONLY | MountAttrFlags::MOUNT_ATTR_NOSUID,
-            propagation: MountPropagationFlags::PRIVATE,
-            userns_fd: None,
-        },
-    )
-    .map_err(|e| Error::SetAttr(dir_override.source_path.clone(), e))?;
-
-    move_mount(
-        detached_src_fd,
-        "",
-        &dir_override.target,
-        "",
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
-    )
-    .map_err(|e| {
-        Error::MoveMount(
-            dir_override.source_path.clone(),
-            dir_override.target_path.clone(),
+            source_path.to_path_buf(),
+            target_path.to_path_buf(),
             e.into(),
         )
     })?;
@@ -200,10 +178,10 @@ fn set_dir_overlayfs(dir_override: &super::config::DirOverride) -> Result<(), Er
         FsMountFlags, FsOpenFlags, MoveMountFlags, fsconfig_create, fsconfig_set_fd,
         fsconfig_set_string, fsmount, fsopen, move_mount,
     };
+    use rustix::system::uname;
+    use semver::Version;
+    use std::os::fd::AsFd;
     {
-        use rustix::system::uname;
-        use semver::Version;
-
         let uname_release = uname().release().to_string_lossy().into_owned();
         let kernel_version = Version::parse(&uname_release)
             .map_err(|e| Error::KernelVersionParse(uname_release.clone(), e))?;
@@ -241,7 +219,7 @@ fn set_dir_overlayfs(dir_override: &super::config::DirOverride) -> Result<(), Er
         AtFlags::EMPTY_PATH,
         &MountAttr {
             attr_clr: MountAttrFlags::empty(),
-            attr_set: MountAttrFlags::MOUNT_ATTR_RDONLY | MountAttrFlags::MOUNT_ATTR_NOSUID,
+            attr_set: MountAttrFlags::MOUNT_ATTR_RDONLY,
             propagation: MountPropagationFlags::PRIVATE,
             userns_fd: None,
         },

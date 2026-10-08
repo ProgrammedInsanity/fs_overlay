@@ -1,7 +1,7 @@
 use crate::mount_function::types::{AtFlags, MountAttr};
 use std::ffi::CStr;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::BorrowedFd;
 
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -18,6 +18,7 @@ pub fn mount_setattr(
     flags: AtFlags,
     mount_attr: &MountAttr<'_>,
 ) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
     let mut attr = mount_attr {
         attr_set: u64::from(mount_attr.attr_set.bits()),
         attr_clr: u64::from(mount_attr.attr_clr.bits()),
@@ -25,7 +26,7 @@ pub fn mount_setattr(
         userns_fd: mount_attr
             .userns_fd
             .as_ref()
-            .map_or(-nix::libc::EBADFD, rustix::fd::AsRawFd::as_raw_fd) as u64,
+            .map_or(-nix::libc::EBADFD, AsRawFd::as_raw_fd) as u64,
     };
 
     let res = unsafe {
